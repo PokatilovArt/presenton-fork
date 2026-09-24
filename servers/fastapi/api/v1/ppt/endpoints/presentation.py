@@ -1,0 +1,1237 @@
+import asyncio
+from datetime import datetime, timezone
+import json
+import math
+import os
+import random
+import traceback
+from typing import Annotated, List, Literal, Optional, Tuple
+import dirtyjson
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Path, Request
+from fastapi.responses import StreamingResponse
+from sqlalchemy import delete
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select
+from constants.presentation import DEFAULT_TEMPLATES
+from enums.webhook_event import WebhookEvent
+from models.api_error_model import APIErrorModel
+from models.generate_presentation_request import GeneratePresentationRequest
+from models.presentation_and_path import PresentationPathAndEditPath
+from models.presentation_from_template import EditPresentationRequest
+from models.presentation_outline_model import (
+    PresentationOutlineModel,
+    SlideOutlineModel,
+)
+from enums.tone import Tone
+from enums.verbosity import Verbosity
+from models.pptx_models import PptxPresentationModel
+from models.presentation_layout import PresentationLayoutModel
+from models.presentation_structure_model import PresentationStructureModel
+from models.presentation_with_slides import (
+    PresentationWithSlides,
+)
+from models.sql.template import TemplateModel
+
+from services.documents_loader import DocumentsLoader
+from services.webhook_service import WebhookService
+from utils.get_layout_by_name import get_layout_by_name
+from services.image_generation_service import ImageGenerationService
+from utils.dict_utils import deep_update
+from utils.export_utils import export_presentation
+from utils.llm_calls.generate_presentation_outlines import generate_ppt_outline
+from models.sql.slide import SlideModel
+from models.sse_response import SSECompleteResponse, SSEErrorResponse, SSEResponse
+
+from services.database import get_async_session, async_session_maker
+from services.temp_file_service import TEMP_FILE_SERVICE
+from services.concurrent_service import CONCURRENT_SERVICE
+from models.sql.presentation import PresentationModel
+from services.pptx_presentation_creator import PptxPresentationCreator
+from models.sql.async_presentation_generation_status import (
+    AsyncPresentationGenerationTaskModel,
+)
+from utils.asset_directory_utils import get_exports_directory, get_images_directory
+from utils.llm_calls.generate_presentation_structure import (
+    generate_presentation_structure,
+)
+from utils.llm_calls.generate_slide_content import (
+    get_slide_content_from_type_and_outline,
+)
+from utils.ppt_utils import (
+    get_presentation_title_from_outlines,
+    select_toc_or_list_slide_layout_index,
+)
+from utils.process_slides import (
+    process_slide_add_placeholder_assets,
+    process_slide_and_fetch_assets,
+)
+import uuid
+
+
+PRESENTATION_ROUTER = APIRouter(prefix="/presentation", tags=["Presentation"])
+
+# Global progress tracker for SSE streaming
+_progress_queues: dict[str, asyncio.Queue] = {}
+
+
+def _notify_progress(task_id: str, percent: int, message: str, status: str = "in_progress", data: dict = None):
+    """Send progress update to SSE listeners."""
+    if task_id in _progress_queues:
+        _progress_queues[task_id].put_nowait({
+            "percent": min(percent, 100),
+            "message": message,
+            "status": status,
+            "data": data,
+        })
+
+
+async def _heartbeat_task(
+    task_id: Optional[str],
+    base_message: str,
+    base_percent: int,
+    ceiling_percent: int,
+    stop_event: asyncio.Event,
+    interval_seconds: float = 15.0,
+):
+    """
+    Tick the async-status row every `interval_seconds` while a slow LLM
+    phase runs. Purpose: external clients polling /status/{taskId} need to
+    see `updated_at` advance so they don't conclude the task is dead and
+    kill it (the gpt backend's smart-watchdog uses updated_at to decide
+    aliveness).
+
+    Why a separate session per tick: AsyncSession is not safe to use from
+    concurrent coroutines. The main handler holds its own session and
+    commits at phase boundaries; we open a fresh session per tick so we
+    never race with it.
+
+    Percent is bumped by +1 each tick up to `ceiling_percent` (so external
+    UI sees forward motion even with no real status change). Message gets a
+    "(Ns elapsed)" suffix so the user knows the system is alive.
+    """
+    if not task_id:
+        return
+    tick = 0
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+            return  # stop_event was set, exit
+        except asyncio.TimeoutError:
+            tick += 1
+
+        elapsed = int(tick * interval_seconds)
+        percent = min(base_percent + tick, ceiling_percent)
+        message = f"{base_message} ({elapsed}s)"
+        # Broadcast to SSE listeners.
+        _notify_progress(task_id, percent, message)
+
+        # Persist to DB on its own session so we don't race with the main
+        # handler's session. Tolerant of all failures: this is a liveness
+        # ping, not a critical write.
+        try:
+            async with async_session_maker() as session:
+                row = await session.get(AsyncPresentationGenerationTaskModel, task_id)
+                if not row:
+                    return
+                if row.status in ("completed", "error"):
+                    return
+                row.message = message
+                row.updated_at = datetime.now(timezone.utc)
+                session.add(row)
+                await session.commit()
+        except Exception as e:
+            # Don't crash the heartbeat — just log and keep going.
+            print(f"[heartbeat] {task_id}: db update failed (non-fatal): {e}")
+
+
+@PRESENTATION_ROUTER.get("/all", response_model=List[PresentationWithSlides])
+async def get_all_presentations(sql_session: AsyncSession = Depends(get_async_session)):
+    presentations_with_slides = []
+
+    query = (
+        select(PresentationModel, SlideModel)
+        .join(
+            SlideModel,
+            (SlideModel.presentation == PresentationModel.id) & (SlideModel.index == 0),
+        )
+        .order_by(PresentationModel.created_at.desc())
+    )
+
+    results = await sql_session.execute(query)
+    rows = results.all()
+    presentations_with_slides = [
+        PresentationWithSlides(
+            **presentation.model_dump(),
+            slides=[first_slide],
+        )
+        for presentation, first_slide in rows
+    ]
+    return presentations_with_slides
+
+
+@PRESENTATION_ROUTER.get("/{id}", response_model=PresentationWithSlides)
+async def get_presentation(
+    id: uuid.UUID, sql_session: AsyncSession = Depends(get_async_session)
+):
+    presentation = await sql_session.get(PresentationModel, id)
+    if not presentation:
+        raise HTTPException(404, "Presentation not found")
+    slides = await sql_session.scalars(
+        select(SlideModel)
+        .where(SlideModel.presentation == id)
+        .order_by(SlideModel.index)
+    )
+    return PresentationWithSlides(
+        **presentation.model_dump(),
+        slides=slides,
+    )
+
+
+@PRESENTATION_ROUTER.delete("/{id}", status_code=204)
+async def delete_presentation(
+    id: uuid.UUID, sql_session: AsyncSession = Depends(get_async_session)
+):
+    presentation = await sql_session.get(PresentationModel, id)
+    if not presentation:
+        raise HTTPException(404, "Presentation not found")
+
+    await sql_session.delete(presentation)
+    await sql_session.commit()
+
+
+@PRESENTATION_ROUTER.post("/create", response_model=PresentationModel)
+async def create_presentation(
+    content: Annotated[str, Body()],
+    n_slides: Annotated[int, Body()],
+    language: Annotated[str, Body()],
+    file_paths: Annotated[Optional[List[str]], Body()] = None,
+    tone: Annotated[Tone, Body()] = Tone.DEFAULT,
+    verbosity: Annotated[Verbosity, Body()] = Verbosity.STANDARD,
+    instructions: Annotated[Optional[str], Body()] = None,
+    include_table_of_contents: Annotated[bool, Body()] = False,
+    include_title_slide: Annotated[bool, Body()] = True,
+    web_search: Annotated[bool, Body()] = False,
+    theme: Annotated[Optional[dict], Body()] = None,
+    sql_session: AsyncSession = Depends(get_async_session),
+):
+
+    if include_table_of_contents and n_slides < 3:
+        raise HTTPException(
+            status_code=400,
+            detail="Number of slides cannot be less than 3 if table of contents is included",
+        )
+
+    presentation_id = uuid.uuid4()
+
+    presentation = PresentationModel(
+        id=presentation_id,
+        content=content,
+        n_slides=n_slides,
+        language=language,
+        file_paths=file_paths,
+        tone=tone.value,
+        verbosity=verbosity.value,
+        instructions=instructions,
+        include_table_of_contents=include_table_of_contents,
+        include_title_slide=include_title_slide,
+        web_search=web_search,
+        theme=theme,
+    )
+
+    sql_session.add(presentation)
+    await sql_session.commit()
+
+    return presentation
+
+
+@PRESENTATION_ROUTER.post("/prepare", response_model=PresentationModel)
+async def prepare_presentation(
+    presentation_id: Annotated[uuid.UUID, Body()],
+    outlines: Annotated[List[SlideOutlineModel], Body()],
+    layout: Annotated[PresentationLayoutModel, Body()],
+    title: Annotated[Optional[str], Body()] = None,
+    sql_session: AsyncSession = Depends(get_async_session),
+):
+    if not outlines:
+        raise HTTPException(status_code=400, detail="Outlines are required")
+
+    presentation = await sql_session.get(PresentationModel, presentation_id)
+    if not presentation:
+        raise HTTPException(status_code=404, detail="Presentation not found")
+
+    # Truncate outlines to requested slide count
+    max_slides = presentation.n_slides
+    if len(outlines) > max_slides:
+        outlines = outlines[:max_slides]
+
+    presentation_outline_model = PresentationOutlineModel(slides=outlines)
+
+    total_slide_layouts = len(layout.slides)
+    total_outlines = len(outlines)
+
+    if layout.ordered:
+        presentation_structure = layout.to_presentation_structure()
+    else:
+        presentation_structure: PresentationStructureModel = (
+            await generate_presentation_structure(
+                presentation_outline=presentation_outline_model,
+                presentation_layout=layout,
+                instructions=presentation.instructions,
+            )
+        )
+
+    presentation_structure.slides = presentation_structure.slides[: len(outlines)]
+    for index in range(total_outlines):
+        random_slide_index = random.randint(0, total_slide_layouts - 1)
+        if index >= total_outlines:
+            presentation_structure.slides.append(random_slide_index)
+            continue
+        if presentation_structure.slides[index] >= total_slide_layouts:
+            presentation_structure.slides[index] = random_slide_index
+
+    if presentation.include_table_of_contents:
+        n_toc_slides = presentation.n_slides - total_outlines
+        toc_slide_layout_index = select_toc_or_list_slide_layout_index(layout)
+        if toc_slide_layout_index != -1:
+            outline_index = 1 if presentation.include_title_slide else 0
+            for i in range(n_toc_slides):
+                outlines_to = outline_index + 10
+                if total_outlines == outlines_to:
+                    outlines_to -= 1
+
+                presentation_structure.slides.insert(
+                    i + 1 if presentation.include_title_slide else i,
+                    toc_slide_layout_index,
+                )
+                toc_outline = "Table of Contents\n\n"
+
+                for outline in presentation_outline_model.slides[
+                    outline_index:outlines_to
+                ]:
+                    page_number = (
+                        outline_index - i + n_toc_slides + 1
+                        if presentation.include_title_slide
+                        else outline_index - i + n_toc_slides
+                    )
+                    toc_outline += f"Slide page number: {page_number}\n Slide Content: {outline.content[:100]}\n\n"
+                    outline_index += 1
+
+                outline_index += 1
+
+                presentation_outline_model.slides.insert(
+                    i + 1 if presentation.include_title_slide else i,
+                    SlideOutlineModel(
+                        content=toc_outline,
+                    ),
+                )
+
+    sql_session.add(presentation)
+    presentation.outlines = presentation_outline_model.model_dump(mode="json")
+    presentation.title = title or presentation.title
+    presentation.set_layout(layout)
+    presentation.set_structure(presentation_structure)
+    await sql_session.commit()
+
+    return presentation
+
+
+@PRESENTATION_ROUTER.get("/stream/{id}", response_model=PresentationWithSlides)
+async def stream_presentation(
+    id: uuid.UUID, sql_session: AsyncSession = Depends(get_async_session)
+):
+    presentation = await sql_session.get(PresentationModel, id)
+    if not presentation:
+        raise HTTPException(status_code=404, detail="Presentation not found")
+    if not presentation.structure:
+        raise HTTPException(
+            status_code=400,
+            detail="Presentation not prepared for stream",
+        )
+    if not presentation.outlines:
+        raise HTTPException(
+            status_code=400,
+            detail="Outlines can not be empty",
+        )
+
+    image_generation_service = ImageGenerationService(get_images_directory())
+
+    async def inner():
+        structure = presentation.get_structure()
+        layout = presentation.get_layout()
+        outline = presentation.get_presentation_outline()
+
+        # These tasks will be gathered and awaited after all slides are generated
+        async_assets_generation_tasks = []
+
+        slides: List[SlideModel] = []
+        # Ensure we don't generate more slides than outlines
+        max_slides = min(len(structure.slides), len(outline.slides))
+        yield SSEResponse(
+            event="response",
+            data=json.dumps({"type": "chunk", "chunk": '{ "slides": [ '}),
+        ).to_string()
+        for i in range(max_slides):
+            slide_layout_index = structure.slides[i]
+            slide_layout = layout.slides[slide_layout_index]
+
+            try:
+                slide_content = await get_slide_content_from_type_and_outline(
+                    slide_layout,
+                    outline.slides[i],
+                    presentation.language,
+                    presentation.tone,
+                    presentation.verbosity,
+                    presentation.instructions,
+                )
+            except HTTPException as e:
+                if e.status_code == 500 and "empty response" in str(e.detail).lower():
+                    print(f"Skipping slide {i}: {e.detail}")
+                    continue
+                yield SSEErrorResponse(detail=e.detail).to_string()
+                return
+            except Exception as e:
+                print(f"Skipping slide {i}: {e}")
+                continue
+
+            slide = SlideModel(
+                presentation=id,
+                layout_group=layout.name,
+                layout=slide_layout.id,
+                index=i,
+                speaker_note=slide_content.get("__speaker_note__", ""),
+                content=slide_content,
+            )
+            slides.append(slide)
+
+            # This will mutate slide and add placeholder assets
+            process_slide_add_placeholder_assets(slide)
+
+            # This will mutate slide - start task immediately so it runs in parallel with next slide LLM generation
+            async_assets_generation_tasks.append(
+                asyncio.create_task(process_slide_and_fetch_assets(image_generation_service, slide))
+            )
+
+            yield SSEResponse(
+                event="response",
+                data=json.dumps({"type": "chunk", "chunk": slide.model_dump_json()}),
+            ).to_string()
+
+        yield SSEResponse(
+            event="response",
+            data=json.dumps({"type": "chunk", "chunk": " ] }"}),
+        ).to_string()
+
+        generated_assets_lists = await asyncio.gather(*async_assets_generation_tasks)
+        generated_assets = []
+        for assets_list in generated_assets_lists:
+            generated_assets.extend(assets_list)
+
+        # Moved this here to make sure new slides are generated before deleting the old ones
+        await sql_session.execute(
+            delete(SlideModel).where(SlideModel.presentation == id)
+        )
+        await sql_session.commit()
+
+        sql_session.add(presentation)
+        sql_session.add_all(slides)
+        sql_session.add_all(generated_assets)
+        await sql_session.commit()
+
+        response = PresentationWithSlides(
+            **presentation.model_dump(),
+            slides=slides,
+        )
+
+        yield SSECompleteResponse(
+            key="presentation",
+            value=response.model_dump(mode="json"),
+        ).to_string()
+
+    return StreamingResponse(inner(), media_type="text/event-stream")
+
+
+@PRESENTATION_ROUTER.patch("/update", response_model=PresentationWithSlides)
+async def update_presentation(
+    request: Request,
+    id: Annotated[uuid.UUID, Body()],
+    n_slides: Annotated[Optional[int], Body()] = None,
+    title: Annotated[Optional[str], Body()] = None,
+    theme: Annotated[Optional[dict], Body()] = None,
+    slides: Annotated[Optional[List[SlideModel]], Body()] = None,
+    sql_session: AsyncSession = Depends(get_async_session),
+):
+    presentation = await sql_session.get(PresentationModel, id)
+    if not presentation:
+        raise HTTPException(status_code=404, detail="Presentation not found")
+
+    presentation_update_dict = {}
+    request_body = await request.json()
+    theme_provided = "theme" in request_body
+    if n_slides:
+        presentation_update_dict["n_slides"] = n_slides
+    if title:
+        presentation_update_dict["title"] = title
+    if theme_provided:
+        presentation_update_dict["theme"] = theme
+
+    if n_slides or title or theme_provided:
+        presentation.sqlmodel_update(presentation_update_dict)
+
+    if slides:
+        # Just to make sure id is UUID
+        for slide in slides:
+            slide.presentation = uuid.UUID(slide.presentation)
+            slide.id = uuid.UUID(slide.id)
+
+        await sql_session.execute(
+            delete(SlideModel).where(SlideModel.presentation == presentation.id)
+        )
+        sql_session.add_all(slides)
+
+    await sql_session.commit()
+
+    return PresentationWithSlides(
+        **presentation.model_dump(),
+        slides=slides or [],
+    )
+
+
+@PRESENTATION_ROUTER.post("/export/pptx", response_model=str)
+async def export_presentation_as_pptx(
+    pptx_model: Annotated[PptxPresentationModel, Body()],
+):
+    temp_dir = TEMP_FILE_SERVICE.create_temp_dir()
+
+    pptx_creator = PptxPresentationCreator(pptx_model, temp_dir)
+    await pptx_creator.create_ppt()
+
+    export_directory = get_exports_directory()
+    pptx_path = os.path.join(
+        export_directory, f"{pptx_model.name or uuid.uuid4()}.pptx"
+    )
+    pptx_creator.save(pptx_path)
+
+    return pptx_path
+
+
+@PRESENTATION_ROUTER.post("/export", response_model=PresentationPathAndEditPath)
+async def export_presentation_as_pptx_or_pdf(
+    id: Annotated[uuid.UUID, Body(description="Presentation ID to export")],
+    export_as: Annotated[
+        Literal["pptx"], Body(description="Format to export the presentation as")
+    ] = "pptx",
+    sql_session: AsyncSession = Depends(get_async_session),
+):
+    presentation = await sql_session.get(PresentationModel, id)
+
+    if not presentation:
+        raise HTTPException(status_code=404, detail="Presentation not found")
+
+    presentation_and_path = await export_presentation(
+        id,
+        presentation.title or str(uuid.uuid4()),
+        export_as,
+    )
+
+    return PresentationPathAndEditPath(
+        **presentation_and_path.model_dump(),
+        edit_path=f"/presentation?id={id}",
+    )
+
+
+async def check_if_api_request_is_valid(
+    request: GeneratePresentationRequest,
+    sql_session: AsyncSession = Depends(get_async_session),
+) -> Tuple[uuid.UUID,]:
+    presentation_id = uuid.uuid4()
+    print(f"Presentation ID: {presentation_id}")
+
+    # Making sure either content, slides markdown or files is provided
+    if not (request.content or request.slides_markdown or request.files):
+        raise HTTPException(
+            status_code=400,
+            detail="Either content or slides markdown or files is required to generate presentation",
+        )
+
+    # Making sure number of slides is greater than 0
+    if request.n_slides <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Number of slides must be greater than 0",
+        )
+
+    # Checking if template is valid
+    if request.template not in DEFAULT_TEMPLATES:
+        request.template = request.template.lower()
+        if not request.template.startswith("custom-"):
+            raise HTTPException(
+                status_code=400,
+                detail="Template not found. Please use a valid template.",
+            )
+        template_id = request.template.replace("custom-", "")
+        try:
+            template = await sql_session.get(TemplateModel, uuid.UUID(template_id))
+            if not template:
+                raise Exception()
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="Template not found. Please use a valid template.",
+            )
+
+    return (presentation_id,)
+
+
+async def generate_presentation_handler(
+    request: GeneratePresentationRequest,
+    presentation_id: uuid.UUID,
+    async_status: Optional[AsyncPresentationGenerationTaskModel],
+    sql_session: AsyncSession = Depends(get_async_session),
+):
+    task_id = async_status.id if async_status else None
+
+    def _progress(percent: int, message: str, status: str = "in_progress", data: dict = None):
+        if async_status:
+            async_status.message = message
+            async_status.updated_at = datetime.now(timezone.utc)
+        if task_id:
+            _notify_progress(task_id, percent, message, status, data)
+
+    try:
+        using_slides_markdown = False
+
+        if request.slides_markdown:
+            using_slides_markdown = True
+            request.n_slides = len(request.slides_markdown)
+
+        if not using_slides_markdown:
+            additional_context = ""
+
+            # Updating async status
+            _progress(random.randint(3, 8), "Generating presentation outlines")
+            if async_status:
+                sql_session.add(async_status)
+                await sql_session.commit()
+
+            if request.files:
+                documents_loader = DocumentsLoader(file_paths=request.files)
+                await documents_loader.load_documents()
+                documents = documents_loader.documents
+                if documents:
+                    additional_context = "\n\n".join(documents)
+
+            # Finding number of slides to generate by considering table of contents
+            n_slides_to_generate = request.n_slides
+            if request.include_table_of_contents:
+                needed_toc_count = math.ceil(
+                    (
+                        (request.n_slides - 1)
+                        if request.include_title_slide
+                        else request.n_slides
+                    )
+                    / 10
+                )
+                n_slides_to_generate -= math.ceil(
+                    (request.n_slides - needed_toc_count) / 10
+                )
+
+            outline_parse_retries = 3
+            presentation_outlines_json = None
+            for outline_attempt in range(outline_parse_retries):
+                presentation_outlines_text = ""
+                async for chunk in generate_ppt_outline(
+                    request.content,
+                    n_slides_to_generate,
+                    request.language,
+                    additional_context,
+                    request.tone.value,
+                    request.verbosity.value,
+                    request.instructions,
+                    request.include_title_slide,
+                    request.web_search,
+                ):
+
+                    if isinstance(chunk, HTTPException):
+                        raise chunk
+
+                    presentation_outlines_text += chunk
+
+                try:
+                    presentation_outlines_json = dict(
+                        dirtyjson.loads(presentation_outlines_text)
+                    )
+                    break  # Successfully parsed
+                except Exception:
+                    if outline_attempt < outline_parse_retries - 1:
+                        print(f"Outline JSON parse failed (attempt {outline_attempt + 1}/{outline_parse_retries}), regenerating...")
+                        continue
+                    traceback.print_exc()
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Failed to generate presentation outlines. Please try again.",
+                    )
+            presentation_outlines = PresentationOutlineModel(
+                **presentation_outlines_json
+            )
+            # Truncate outlines to requested count (LLM may generate extras)
+            if len(presentation_outlines.slides) > n_slides_to_generate:
+                presentation_outlines.slides = presentation_outlines.slides[:n_slides_to_generate]
+            total_outlines = len(presentation_outlines.slides)
+
+        else:
+            # Setting outlines to slides markdown
+            presentation_outlines = PresentationOutlineModel(
+                slides=[
+                    SlideOutlineModel(content=slide)
+                    for slide in request.slides_markdown
+                ]
+            )
+            total_outlines = len(request.slides_markdown)
+
+        # Updating async status
+        _progress(random.randint(15, 25), "Selecting layout for each slide")
+        if async_status:
+            sql_session.add(async_status)
+            await sql_session.commit()
+
+        print("-" * 40)
+        print(f"Generated {total_outlines} outlines for the presentation")
+
+        # Parse Layouts
+        layout_model = await get_layout_by_name(request.template)
+        total_slide_layouts = len(layout_model.slides)
+
+        # Generate Structure — slow LLM call. Run a heartbeat in parallel
+        # so external pollers see updated_at advance and our percent ticks
+        # upward. Without this, /status/{taskId} stays at the previous
+        # "Selecting layout" message for several minutes and the gpt
+        # backend's watchdog assumes the task is dead and kills it.
+        if layout_model.ordered:
+            presentation_structure = layout_model.to_presentation_structure()
+        else:
+            _hb_stop = asyncio.Event()
+            _hb = asyncio.create_task(_heartbeat_task(
+                task_id,
+                "Selecting layout for each slide",
+                base_percent=25,
+                ceiling_percent=27,
+                stop_event=_hb_stop,
+            ))
+            try:
+                presentation_structure: PresentationStructureModel = (
+                    await generate_presentation_structure(
+                        presentation_outlines,
+                        layout_model,
+                        request.instructions,
+                        using_slides_markdown,
+                    )
+                )
+            finally:
+                _hb_stop.set()
+                try:
+                    await _hb
+                except Exception:
+                    pass
+
+        presentation_structure.slides = presentation_structure.slides[:total_outlines]
+        for index in range(total_outlines):
+            random_slide_index = random.randint(0, total_slide_layouts - 1)
+            if index >= total_outlines:
+                presentation_structure.slides.append(random_slide_index)
+                continue
+            if presentation_structure.slides[index] >= total_slide_layouts:
+                presentation_structure.slides[index] = random_slide_index
+
+        # Injecting table of contents to the presentation structure and outlines
+        if request.include_table_of_contents and not using_slides_markdown:
+            n_toc_slides = request.n_slides - total_outlines
+            toc_slide_layout_index = select_toc_or_list_slide_layout_index(layout_model)
+            if toc_slide_layout_index != -1:
+                outline_index = 1 if request.include_title_slide else 0
+                for i in range(n_toc_slides):
+                    outlines_to = outline_index + 10
+                    if total_outlines == outlines_to:
+                        outlines_to -= 1
+
+                    presentation_structure.slides.insert(
+                        i + 1 if request.include_title_slide else i,
+                        toc_slide_layout_index,
+                    )
+                    toc_outline = "Table of Contents\n\n"
+
+                    for outline in presentation_outlines.slides[
+                        outline_index:outlines_to
+                    ]:
+                        page_number = (
+                            outline_index - i + n_toc_slides + 1
+                            if request.include_title_slide
+                            else outline_index - i + n_toc_slides
+                        )
+                        toc_outline += f"Slide page number: {page_number}\n Slide Content: {outline.content[:100]}\n\n"
+                        outline_index += 1
+
+                    outline_index += 1
+
+                    presentation_outlines.slides.insert(
+                        i + 1 if request.include_title_slide else i,
+                        SlideOutlineModel(
+                            content=toc_outline,
+                        ),
+                    )
+
+        # Create PresentationModel
+        presentation = PresentationModel(
+            id=presentation_id,
+            content=request.content,
+            n_slides=request.n_slides,
+            language=request.language,
+            title=get_presentation_title_from_outlines(presentation_outlines),
+            outlines=presentation_outlines.model_dump(),
+            layout=layout_model.model_dump(),
+            structure=presentation_structure.model_dump(),
+            tone=request.tone.value,
+            verbosity=request.verbosity.value,
+            instructions=request.instructions,
+        )
+
+        _progress(random.randint(28, 35), "Generating slides")
+        if async_status:
+            sql_session.add(async_status)
+            await sql_session.commit()
+
+        image_generation_service = ImageGenerationService(get_images_directory())
+        async_assets_generation_tasks = []
+
+        # 7. Generate slide content concurrently (batched), then build slides and fetch assets
+        slides: List[SlideModel] = []
+
+        slide_layout_indices = presentation_structure.slides
+        slide_layouts = [layout_model.slides[idx] for idx in slide_layout_indices]
+
+        # Schedule slide content generation and asset fetching in batches of 10
+        batch_size = 10
+        for start in range(0, len(slide_layouts), batch_size):
+            end = min(start + batch_size, len(slide_layouts))
+
+            print(f"Generating slides from {start} to {end}")
+
+            # Generate contents for this batch concurrently
+            content_tasks = [
+                get_slide_content_from_type_and_outline(
+                    slide_layouts[i],
+                    presentation_outlines.slides[i],
+                    request.language,
+                    request.tone.value,
+                    request.verbosity.value,
+                    request.instructions,
+                )
+                for i in range(start, end)
+            ]
+            # Heartbeat for THIS batch only (so percent ceiling reflects how
+            # much of the work remains). Otherwise a single Gemini retry on
+            # batch 1 of 5 looks identical to one on batch 5 of 5 in the UI.
+            _batch_ceiling = 35 + int((end / len(slide_layouts)) * 40) - 1
+            _hb_stop = asyncio.Event()
+            _hb = asyncio.create_task(_heartbeat_task(
+                task_id,
+                f"Generating slides {start + 1}-{end}/{len(slide_layouts)}",
+                base_percent=35 + int((start / len(slide_layouts)) * 40),
+                ceiling_percent=max(_batch_ceiling, 36),
+                stop_event=_hb_stop,
+            ))
+            try:
+                batch_results = await asyncio.gather(*content_tasks, return_exceptions=True)
+            finally:
+                _hb_stop.set()
+                try:
+                    await _hb
+                except Exception:
+                    pass
+
+            # Progress: 35-75% for slide generation
+            slides_done = min(end, len(slide_layouts))
+            slide_progress = 35 + int((slides_done / len(slide_layouts)) * 40)
+            _progress(slide_progress, f"Generated {slides_done}/{len(slide_layouts)} slides")
+
+            # Build slides for this batch (skip failed slides)
+            batch_slides: List[SlideModel] = []
+            for offset, slide_result in enumerate(batch_results):
+                if isinstance(slide_result, Exception):
+                    print(f"Skipping slide {start + offset}: {slide_result}")
+                    continue
+                slide_content = slide_result
+                i = start + offset
+                slide_layout = slide_layouts[i]
+                slide = SlideModel(
+                    presentation=presentation_id,
+                    layout_group=layout_model.name,
+                    layout=slide_layout.id,
+                    index=i,
+                    speaker_note=slide_content.get("__speaker_note__"),
+                    content=slide_content,
+                )
+                # Pre-set placeholder asset URLs so the slide is renderable
+                # even if its real-asset fetch later fails or gets cancelled
+                # on the FETCH_ASSETS_TIMEOUT path. process_slide_and_fetch_assets
+                # overwrites these with real URLs on success.
+                process_slide_add_placeholder_assets(slide)
+                slides.append(slide)
+                batch_slides.append(slide)
+
+            # Start asset fetch tasks immediately so they run in parallel with next batch's LLM calls
+            asset_tasks = [
+                asyncio.create_task(process_slide_and_fetch_assets(image_generation_service, slide))
+                for slide in batch_slides
+            ]
+            async_assets_generation_tasks.extend(asset_tasks)
+
+        _progress(random.randint(76, 82), "Fetching images and assets")
+        if async_status:
+            sql_session.add(async_status)
+            await sql_session.commit()
+
+        # Run all asset tasks concurrently while batches may still be generating content.
+        # Heartbeat: Pexels API + Gemini image generation can each take 30-90s,
+        # all in flight at once. Without a tick here external pollers see
+        # "Fetching images and assets" frozen for several minutes.
+        _hb_stop = asyncio.Event()
+        _hb = asyncio.create_task(_heartbeat_task(
+            task_id,
+            "Fetching images and assets",
+            base_percent=78,
+            ceiling_percent=83,
+            stop_event=_hb_stop,
+        ))
+        # Hard ceiling on the whole asset-fetch phase. Each slide task already
+        # falls back to a placeholder on its own failure, but a wedged socket
+        # (e.g. a stock/AI provider that accepts the connection then never
+        # responds) can hang the gather indefinitely and freeze updated_at.
+        # On timeout we drop the un-fetched assets (slides keep their
+        # placeholder URLs from process_slide_add_placeholder_assets) rather
+        # than letting the watchdog kill the whole presentation.
+        _fetch_timeout = int(os.getenv("FETCH_ASSETS_TIMEOUT", "300") or 300)
+        try:
+            generated_assets_list = await asyncio.wait_for(
+                asyncio.gather(*async_assets_generation_tasks),
+                timeout=_fetch_timeout,
+            )
+        except asyncio.TimeoutError:
+            print(
+                f"[fetch] asset fetch exceeded {_fetch_timeout}s — proceeding with "
+                f"placeholders for un-fetched slides"
+            )
+            generated_assets_list = []
+            for t in async_assets_generation_tasks:
+                if t.done() and not t.cancelled() and t.exception() is None:
+                    generated_assets_list.append(t.result())
+                else:
+                    t.cancel()
+        finally:
+            _hb_stop.set()
+            try:
+                await _hb
+            except Exception:
+                pass
+        generated_assets = []
+        for assets_list in generated_assets_list:
+            generated_assets.extend(assets_list)
+
+        # 8. Save PresentationModel and Slides
+        sql_session.add(presentation)
+        sql_session.add_all(slides)
+        sql_session.add_all(generated_assets)
+        await sql_session.commit()
+
+        _progress(random.randint(85, 92), "Exporting presentation")
+        if async_status:
+            sql_session.add(async_status)
+            # Commit BEFORE the export so `updated_at` reflects entry into this
+            # phase. Without this the row still shows the "Fetching images"
+            # timestamp for the whole (multi-minute) export.
+            await sql_session.commit()
+
+        # 9. Export — slow (Puppeteer render + python-pptx). Run a heartbeat so
+        # external pollers keep seeing updated_at advance; this phase used to
+        # have none, which is exactly where tasks were dying at 85-92%.
+        _hb_stop = asyncio.Event()
+        _hb = asyncio.create_task(_heartbeat_task(
+            task_id,
+            "Exporting presentation",
+            base_percent=92,
+            ceiling_percent=98,
+            stop_event=_hb_stop,
+        ))
+        try:
+            presentation_and_path = await export_presentation(
+                presentation_id, presentation.title or str(uuid.uuid4()), request.export_as
+            )
+        finally:
+            _hb_stop.set()
+            try:
+                await _hb
+            except Exception:
+                pass
+
+        response = PresentationPathAndEditPath(
+            **presentation_and_path.model_dump(),
+            edit_path=f"/presentation?id={presentation_id}",
+        )
+
+        _progress(100, "Presentation generation completed", "completed", response.model_dump(mode="json"))
+        if async_status:
+            async_status.status = "completed"
+            async_status.data = response.model_dump(mode="json")
+            sql_session.add(async_status)
+            await sql_session.commit()
+
+        # Triggering webhook on success. We extend the public payload with
+        # `task_id` so downstream subscribers (gpt backend) can look up the
+        # async task row they created when calling /generate/async.
+        # Presenton's own clients ignore unknown fields, so this is BC-safe.
+        _webhook_payload = response.model_dump(mode="json")
+        if async_status is not None:
+            _webhook_payload["task_id"] = async_status.id
+        CONCURRENT_SERVICE.run_task(
+            None,
+            WebhookService.send_webhook,
+            WebhookEvent.PRESENTATION_GENERATION_COMPLETED,
+            _webhook_payload,
+        )
+
+        return response
+
+    except Exception as e:
+        if not isinstance(e, HTTPException):
+            traceback.print_exc()
+            e = HTTPException(status_code=500, detail="Presentation generation failed")
+
+        api_error_model = APIErrorModel.from_exception(e)
+
+        # Triggering webhook on failure (include task_id, same as success).
+        _err_payload = api_error_model.model_dump(mode="json")
+        if async_status is not None:
+            _err_payload["task_id"] = async_status.id
+        CONCURRENT_SERVICE.run_task(
+            None,
+            WebhookService.send_webhook,
+            WebhookEvent.PRESENTATION_GENERATION_FAILED,
+            _err_payload,
+        )
+
+        _progress(0, "Presentation generation failed", "error")
+
+        if async_status:
+            async_status.status = "error"
+            async_status.message = "Presentation generation failed"
+            async_status.updated_at = datetime.now(timezone.utc)
+            async_status.error = api_error_model.model_dump(mode="json")
+            sql_session.add(async_status)
+            await sql_session.commit()
+
+        else:
+            raise e
+
+
+@PRESENTATION_ROUTER.post("/generate", response_model=PresentationPathAndEditPath)
+async def generate_presentation_sync(
+    request: GeneratePresentationRequest,
+    sql_session: AsyncSession = Depends(get_async_session),
+):
+    try:
+        (presentation_id,) = await check_if_api_request_is_valid(request, sql_session)
+        return await generate_presentation_handler(
+            request, presentation_id, None, sql_session
+        )
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Presentation generation failed")
+
+
+@PRESENTATION_ROUTER.post(
+    "/generate/async", response_model=AsyncPresentationGenerationTaskModel
+)
+async def generate_presentation_async(
+    request: GeneratePresentationRequest,
+    background_tasks: BackgroundTasks,
+    sql_session: AsyncSession = Depends(get_async_session),
+):
+    try:
+        (presentation_id,) = await check_if_api_request_is_valid(request, sql_session)
+
+        async_status = AsyncPresentationGenerationTaskModel(
+            status="pending",
+            message="Queued for generation",
+            data=None,
+        )
+        sql_session.add(async_status)
+        await sql_session.commit()
+
+        background_tasks.add_task(
+            generate_presentation_handler,
+            request,
+            presentation_id,
+            async_status=async_status,
+            sql_session=sql_session,
+        )
+        return async_status
+
+    except Exception as e:
+        if not isinstance(e, HTTPException):
+            print(e)
+            e = HTTPException(status_code=500, detail="Presentation generation failed")
+
+        raise e
+
+
+@PRESENTATION_ROUTER.get(
+    "/status/{id}", response_model=AsyncPresentationGenerationTaskModel
+)
+async def check_async_presentation_generation_status(
+    id: str = Path(description="ID of the presentation generation task"),
+    sql_session: AsyncSession = Depends(get_async_session),
+):
+    status = await sql_session.get(AsyncPresentationGenerationTaskModel, id)
+    if not status:
+        raise HTTPException(
+            status_code=404, detail="No presentation generation task found"
+        )
+    return status
+
+
+@PRESENTATION_ROUTER.get("/task/{id}/stream")
+async def stream_task_progress(
+    id: str = Path(description="ID of the presentation generation task"),
+    sql_session: AsyncSession = Depends(get_async_session),
+):
+    """SSE endpoint that streams progress updates for an async task."""
+    status = await sql_session.get(AsyncPresentationGenerationTaskModel, id)
+    if not status:
+        raise HTTPException(status_code=404, detail="No presentation generation task found")
+
+    # If already completed or failed, return final state immediately
+    if status.status in ("completed", "error"):
+        async def done_stream():
+            event_data = {
+                "percent": 100 if status.status == "completed" else 0,
+                "message": status.message or "",
+                "status": status.status,
+                "data": status.data,
+                "error": status.error,
+            }
+            yield f"data: {json.dumps(event_data)}\n\n"
+        return StreamingResponse(done_stream(), media_type="text/event-stream")
+
+    # Create queue for this task
+    queue: asyncio.Queue = asyncio.Queue()
+    _progress_queues[id] = queue
+
+    async def event_stream():
+        try:
+            while True:
+                try:
+                    update = await asyncio.wait_for(queue.get(), timeout=2.0)
+                    yield f"data: {json.dumps(update)}\n\n"
+                    if update.get("status") in ("completed", "error"):
+                        break
+                except asyncio.TimeoutError:
+                    # Send keepalive and check DB for status
+                    refreshed = await sql_session.get(AsyncPresentationGenerationTaskModel, id)
+                    if refreshed and refreshed.status in ("completed", "error"):
+                        event_data = {
+                            "percent": 100 if refreshed.status == "completed" else 0,
+                            "message": refreshed.message or "",
+                            "status": refreshed.status,
+                            "data": refreshed.data,
+                            "error": refreshed.error,
+                        }
+                        yield f"data: {json.dumps(event_data)}\n\n"
+                        break
+                    yield f": keepalive\n\n"
+        finally:
+            _progress_queues.pop(id, None)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@PRESENTATION_ROUTER.post("/edit", response_model=PresentationPathAndEditPath)
+async def edit_presentation_with_new_content(
+    data: Annotated[EditPresentationRequest, Body()],
+    sql_session: AsyncSession = Depends(get_async_session),
+):
+    presentation = await sql_session.get(PresentationModel, data.presentation_id)
+    if not presentation:
+        raise HTTPException(status_code=404, detail="Presentation not found")
+
+    slides = await sql_session.scalars(
+        select(SlideModel).where(SlideModel.presentation == data.presentation_id)
+    )
+
+    new_slides = []
+    slides_to_delete = []
+    for each_slide in slides:
+        updated_content = None
+        new_slide_data = list(
+            filter(lambda x: x.index == each_slide.index, data.slides)
+        )
+        if new_slide_data:
+            updated_content = deep_update(each_slide.content, new_slide_data[0].content)
+            new_slides.append(
+                each_slide.get_new_slide(presentation.id, updated_content)
+            )
+            slides_to_delete.append(each_slide.id)
+
+    await sql_session.execute(
+        delete(SlideModel).where(SlideModel.id.in_(slides_to_delete))
+    )
+
+    sql_session.add_all(new_slides)
+    await sql_session.commit()
+
+    presentation_and_path = await export_presentation(
+        presentation.id, presentation.title or str(uuid.uuid4()), data.export_as
+    )
+
+    return PresentationPathAndEditPath(
+        **presentation_and_path.model_dump(),
+        edit_path=f"/presentation?id={presentation.id}",
+    )
+
+
+@PRESENTATION_ROUTER.post("/derive", response_model=PresentationPathAndEditPath)
+async def derive_presentation_from_existing_one(
+    data: Annotated[EditPresentationRequest, Body()],
+    sql_session: AsyncSession = Depends(get_async_session),
+):
+    presentation = await sql_session.get(PresentationModel, data.presentation_id)
+    if not presentation:
+        raise HTTPException(status_code=404, detail="Presentation not found")
+
+    slides = await sql_session.scalars(
+        select(SlideModel).where(SlideModel.presentation == data.presentation_id)
+    )
+
+    new_presentation = presentation.get_new_presentation()
+    new_slides = []
+    for each_slide in slides:
+        updated_content = None
+        new_slide_data = list(
+            filter(lambda x: x.index == each_slide.index, data.slides)
+        )
+        if new_slide_data:
+            updated_content = deep_update(each_slide.content, new_slide_data[0].content)
+        new_slides.append(
+            each_slide.get_new_slide(new_presentation.id, updated_content)
+        )
+
+    sql_session.add(new_presentation)
+    sql_session.add_all(new_slides)
+    await sql_session.commit()
+
+    presentation_and_path = await export_presentation(
+        new_presentation.id, new_presentation.title or str(uuid.uuid4()), data.export_as
+    )
+
+    return PresentationPathAndEditPath(
+        **presentation_and_path.model_dump(),
+        edit_path=f"/presentation?id={new_presentation.id}",
+    )
